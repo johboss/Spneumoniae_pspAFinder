@@ -1,0 +1,39 @@
+# --- Pipeline outputs & logs (ignore) ---
+01_denovo/
+04_best/
+05_boxb_per_sample/
+06_boxb_reports/
+07_tree/
+02_output/
+logs/
+*.blastx.txt
+*.blastn.txt
+*.aln.fna
+*.nwk
+*.png
+*.csv
+*.json
+*.sam
+*.bam
+*.bai
+*.depth.txt
+
+# --- BLAST DBs: ignore globally, but ALLOW the two required DB directories ---
+# ignore other DBs
+*.pin
+*.psq
+*.phr
+*.nin
+*.nsq
+*.nhr
+*.mmi
+
+# keep BoxB DB
+!01_fasta/03_Hollingshead_onlyboxB/CladeDefineRegion_prot_DB.pin
+!01_fasta/03_Hollingshead_onlyboxB/CladeDefineRegion_prot_DB.psq
+!01_fasta/03_Hollingshead_onlyboxB/CladeDefineRegion_prot_DB.phr
+
+# keep pspA DB
+!01_fasta/02_Hollingshead_pspA/hollingshead_proteinDB.pin
+!01_fasta/02_Hollingshead_pspA/hollingshead_proteinDB.psq
+
