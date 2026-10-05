@@ -4,6 +4,7 @@
 De-novo pspA detection with BLASTX + 200-bp upstream validation.
 Outputs under {--work-dir}/01_denovo/ :
  - filtered_pspA_hits.fasta
+ - filtered_pspA_hit_coordinates.csv
  - summary_fixed_200bp_upstream.csv
  - denovo_summary.csv
 Optional: de-novo NT tree (off by default).
@@ -24,6 +25,7 @@ import re
 import tempfile
 import argparse
 import multiprocessing as mp
+import csv
 from typing import Dict, List, Tuple, Optional, Any
 import pandas as pd
 from Bio import SeqIO
@@ -36,7 +38,11 @@ from pspA_utils import (
 
 # ---------- helpers ----------
 def enumerate_assemblies(assemblies_dir: str) -> List[str]:
-    return sorted(os.path.splitext(f)[0] for f in os.listdir(assemblies_dir) if f.endswith(".fasta"))
+    return sorted(
+        os.path.splitext(filename)[0]
+        for filename in os.listdir(assemblies_dir)
+        if filename.endswith(".fasta") and not filename.startswith("._")
+    )
 
 def assemble_blastx_cmd(
     query_fa: str,
@@ -228,7 +234,7 @@ def _process_one_sample(
 ) -> Dict[str, Any]:
     """
     Worker: run BLASTX on one assembly, select hits, validate upstream, write per-sample temp outputs.
-    Returns a dict with counts and the kept SeqRecords (coding NT).
+    Returns a dict with counts, kept SeqRecords, and their source coordinates.
     """
     sample_fa = os.path.join(assemblies_dir, f"{sample}.fasta")
     if not os.path.exists(sample_fa):
@@ -258,7 +264,8 @@ def _process_one_sample(
 
     total_hsps = len(df)
     if total_hsps == 0:
-        return {"sample": sample, "total_hsps": 0, "kept": 0, "upstream_confirmed": 0, "high_conf": 0, "seqs": []}
+        return {"sample": sample, "total_hsps": 0, "kept": 0, "upstream_confirmed": 0, "high_conf": 0,
+                "seqs": [], "coordinates": []}
 
     # 2) Select non-overlapping hits
     hit_dicts = [hit_row_to_dict(row) for _, row in df.iterrows()]
@@ -331,7 +338,17 @@ def _process_one_sample(
         "kept": int(len(selected)),
         "upstream_confirmed": int(upstream_confirmed),
         "high_conf": int(high_conf),
-        "seqs": [coding for (coding, _, _) in kept_records]
+        "seqs": [coding for (coding, _, _) in kept_records],
+        "coordinates": [
+            {
+                "Sample": sample,
+                "Contig": hit["contig"],
+                "Strand": hit["strand"],
+                "qstart": hit["qstart"],
+                "qend": hit["qend"],
+            }
+            for (_, hit, _) in kept_records
+        ]
     }
 
 def detect_denovo_pspA(
@@ -402,18 +419,33 @@ def detect_denovo_pspA(
 
     # Aggregate filtered sequences
     filtered_fa = os.path.join(out_denovo, "filtered_pspA_hits.fasta")
+    coordinates_csv = os.path.join(out_denovo, "filtered_pspA_hit_coordinates.csv")
     total_written = 0
+    coordinate_rows: List[Dict[str, Any]] = []
     with open(filtered_fa, "w") as fout:
         for rec in results:
             sid = rec.get("sample")
             seqs: List[SeqRecord] = rec.get("seqs", [])
+            coordinates: List[Dict[str, Any]] = rec.get("coordinates", [])
             # write all kept (now HighConfidence-only if enabled)
             for i, srec in enumerate(seqs, start=1):
                 out_id = f"{sid}__hit{i}"
                 srec.id = out_id
                 srec.description = ""
                 SeqIO.write(srec, fout, "fasta")
+                if i <= len(coordinates):
+                    coordinate_row = dict(coordinates[i - 1])
+                    coordinate_row["CodingID"] = out_id
+                    coordinate_rows.append(coordinate_row)
                 total_written += 1
+
+    with open(coordinates_csv, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=["CodingID", "Sample", "Contig", "Strand", "qstart", "qend"],
+        )
+        writer.writeheader()
+        writer.writerows(coordinate_rows)
 
     # Write per-assembly summary
     denovo_summary_csv = os.path.join(out_denovo, "denovo_summary.csv")
