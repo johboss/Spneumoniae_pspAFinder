@@ -7,6 +7,8 @@ Unified orchestrator for pspA de-novo detection, rescue, BoxB classification, an
 import os
 import argparse
 import tempfile
+import csv
+import subprocess
 import pandas as pd
 from typing import Dict, List, Tuple, Optional
 from Bio import SeqIO
@@ -21,9 +23,15 @@ from pspA_utils import (
 from core_boxb_classifier import classify_boxb
 from denovo_pspA_detect import detect_denovo_pspA
 from rescue_refguided import rescue_for_strains
+from upstream_phylogeny import build_upstream_phylogeny
+from orf_refinement import refine_pspa_orf
 
 SUMMARY_HEADER = [
     "Sample", "CodingID", "Status",
+    "Contig", "Strand", "qstart", "qend",
+    "BLASTX_start", "BLASTX_end", "ORF_start", "ORF_end",
+    "ORF_confidence", "PSPA_CONTIG_START", "PSPA_CONTIG_END",
+    "UPSTREAM_CONTIG_BREAK",
     "Matching_pspA_reference", "Hollingshead_family",
     "pident", "bitscore", "AA_Length",
     "AA_BoxB", "evalue", "qstart_nt", "qend_nt", "qframe", "Source"
@@ -33,9 +41,21 @@ COMPACT_HEADER = [
     "Matching_pspA_reference", "Hollingshead_family",
     "pident", "bitscore", "AA_Length", "All_Matching_pspA_references"
 ]
+CONFIRMED_HEADER = [
+    "Assembly", "CodingID", "Contig", "Strand", "qstart", "qend",
+    "BLASTX_start", "BLASTX_end", "ORF_start", "ORF_end",
+    "ORF_confidence", "PSPA_CONTIG_START", "PSPA_CONTIG_END",
+    "UPSTREAM_CONTIG_BREAK",
+    "Hollingshead_family", "pspA_family", "pspA_clade",
+    "Matching_pspA_reference", "pident", "bitscore", "Status", "Source"
+]
 
 def enumerate_assemblies(assemblies_dir: str) -> List[str]:
-    return sorted(os.path.splitext(f)[0] for f in os.listdir(assemblies_dir) if f.endswith(".fasta"))
+    return sorted(
+        os.path.splitext(filename)[0]
+        for filename in os.listdir(assemblies_dir)
+        if filename.endswith(".fasta") and not filename.startswith("._")
+    )
 
 def fasta_record_count(path: str) -> int:
     if not os.path.exists(path) or os.path.getsize(path) == 0:
@@ -54,6 +74,92 @@ def load_filtered_coding(nt_fasta: str) -> Tuple[Dict[str, List[SeqRecord]], Dic
         by_sample.setdefault(sid, []).append(rec)
     copy_number = {sid: len(lst) for sid, lst in by_sample.items()}
     return by_sample, copy_number
+
+def load_hit_coordinates(path: str) -> Dict[str, Dict[str, str]]:
+    """Load denovo locus coordinates keyed by the exact filtered FASTA ID."""
+    if not os.path.exists(path):
+        return {}
+    with open(path, newline="") as f:
+        return {
+            row["CodingID"]: row
+            for row in csv.DictReader(f)
+            if row.get("CodingID")
+        }
+
+def add_orf_refinement(
+    rows: List[Dict],
+    assemblies_dir: str,
+    protein_db: Optional[str],
+    threads: int,
+    window: int,
+    protein_subject_fasta: Optional[str],
+) -> None:
+    """Refine coordinate-bearing confirmed rows in place."""
+    for row in rows:
+        row.update({
+            "BLASTX_start": row.get("qstart", ""),
+            "BLASTX_end": row.get("qend", ""),
+            "ORF_start": "",
+            "ORF_end": "",
+            "ORF_confidence": "",
+            "PSPA_CONTIG_START": "",
+            "PSPA_CONTIG_END": "",
+            "UPSTREAM_CONTIG_BREAK": "",
+        })
+        if row.get("Status") != "Matched" or not row.get("Contig"):
+            continue
+        if not protein_db and not protein_subject_fasta:
+            row["ORF_confidence"] = "Low"
+            row["UPSTREAM_CONTIG_BREAK"] = True
+            continue
+        assembly = os.path.join(assemblies_dir, f"{row['Sample']}.fasta")
+        if not os.path.exists(assembly):
+            raise FileNotFoundError(f"Assembly not found for ORF refinement: {assembly}")
+        refined = refine_pspa_orf(
+            assembly_fasta=assembly,
+            contig_id=str(row["Contig"]),
+            strand=str(row["Strand"]),
+            blastx_start=int(row["qstart"]),
+            blastx_end=int(row["qend"]),
+            protein_db=protein_db,
+            protein_subject_fasta=protein_subject_fasta,
+            threads=threads,
+            window=window,
+        )
+        row.update(refined)
+
+def write_confirmed_pspa_sequences(
+    path: str,
+    sequences: Dict[str, SeqRecord],
+    summary_rows: List[Dict],
+) -> int:
+    """Write nucleotide sequences for every BoxB-confirmed classification."""
+    written = 0
+    with open(path, "w") as handle:
+        for row in summary_rows:
+            if row.get("Status") not in {"Matched", "Rescue_Matched"}:
+                continue
+            coding_id = str(row.get("CodingID", ""))
+            record = sequences.get(coding_id)
+            if record is None:
+                raise KeyError(f"No nucleotide sequence retained for confirmed CodingID {coding_id}")
+            record = record[:]
+            record.id = coding_id
+            record.description = ""
+            SeqIO.write(record, handle, "fasta")
+            written += 1
+    return written
+
+def align_confirmed_pspa_sequences(input_fasta: str, output_fasta: str, threads: int) -> None:
+    """Align confirmed pspA nucleotide sequences with MAFFT."""
+    if not os.path.exists(input_fasta) or os.path.getsize(input_fasta) == 0:
+        return
+    with open(output_fasta, "w") as handle:
+        subprocess.run(
+            ["mafft", "--thread", str(max(1, threads)), "--auto", input_fasta],
+            stdout=handle,
+            check=True,
+        )
 
 def is_nonempty_file(p: str) -> bool:
     return os.path.exists(p) and os.path.getsize(p) > 0
@@ -167,6 +273,15 @@ def main():
     ap.add_argument("--work-dir", required=True)
     ap.add_argument("--threads", type=int, default=12)
     ap.add_argument("--build-tree", action="store_true")
+    ap.add_argument("--gff-root", default="/Volumes/T7/03_annotations")
+    ap.add_argument("--metadata-csv", default="/Users/john.boss/39_Metadata/Metadata_ALL.csv")
+    ap.add_argument("--build-upstream-tree", action="store_true")
+    ap.add_argument("--build-pspa-alignment", action="store_true",
+                    help="Align confirmed pspA nucleotide sequences with MAFFT")
+    ap.add_argument("--max-upstream-length", type=int, default=500,
+                    help="Maximum upstream nucleotides retained per confirmed locus")
+    ap.add_argument("--orf-window", type=int, default=2000,
+                    help="Bases on each side of a BLASTX hit searched for ORF refinement")
     ap.add_argument("--max-per-sample", type=int, default=1)
 
     # De-novo
@@ -216,6 +331,7 @@ def main():
         filtered_coding_fa = args.filtered_coding_fasta
     else:
         filtered_coding_fa = os.path.join(d01, "filtered_pspA_hits.fasta")
+    coordinates_csv = os.path.join(os.path.dirname(filtered_coding_fa), "filtered_pspA_hit_coordinates.csv")
     need_denovo = fasta_record_count(filtered_coding_fa) == 0
 
     if need_denovo:
@@ -245,6 +361,7 @@ def main():
             only_high_confidence=bool(args.denovo_only_highconf)
         )
 
+    hit_coordinates = load_hit_coordinates(coordinates_csv)
     if fasta_record_count(filtered_coding_fa) == 0:
         print("[WARN] No de-novo pspA coding sequences found after detection.")
 
@@ -274,6 +391,7 @@ def main():
 
     # Classification
     summary_rows: List[Dict] = []
+    confirmed_sequences: Dict[str, SeqRecord] = {}
     sample_best: Dict[str, Dict] = {}
     all_refs_per_sample: Dict[str, List[str]] = {}
 
@@ -293,9 +411,16 @@ def main():
                 sort_field="bitscore",
                 threads=threads
             )
+            out_rec.update({
+                "Contig": hit_coordinates.get(rec.id, {}).get("Contig", ""),
+                "Strand": hit_coordinates.get(rec.id, {}).get("Strand", ""),
+                "qstart": hit_coordinates.get(rec.id, {}).get("qstart", ""),
+                "qend": hit_coordinates.get(rec.id, {}).get("qend", ""),
+            })
             out_rec["Source"] = "DeNovo"
             summary_rows.append(out_rec)
             if out_rec.get("Status") == "Matched":
+                confirmed_sequences[out_rec["CodingID"]] = rec
                 if sid not in sample_best or float(out_rec["bitscore"]) > float(sample_best[sid]["bitscore"]):
                     sample_best[sid] = out_rec
                 all_refs_per_sample.setdefault(sid, []).append(str(out_rec["Matching_pspA_reference"]))
@@ -321,9 +446,11 @@ def main():
                     sort_field="bitscore",
                     threads=threads
                 )
+                out_rec.update({"Contig": "", "Strand": "", "qstart": "", "qend": ""})
                 out_rec["Source"] = q.get("status", "Rescue_Qualified")
                 summary_rows.append(out_rec)
                 if out_rec.get("Status") == "Matched":
+                    confirmed_sequences[out_rec["CodingID"]] = next(SeqIO.parse(rescued_fa, "fasta"))
                     if sid not in sample_best or float(out_rec["bitscore"]) > float(sample_best[sid]["bitscore"]):
                         sample_best[sid] = out_rec
                     all_refs_per_sample.setdefault(sid, []).append(str(out_rec["Matching_pspA_reference"]))
@@ -343,22 +470,92 @@ def main():
                 sort_field="bitscore",
                 threads=threads
             )
+            out_rec.update({"Contig": "", "Strand": "", "qstart": "", "qend": ""})
             out_rec["Source"] = r.get("status", "Rescue")
             summary_rows.append(out_rec)
             if out_rec.get("Status") == "Matched":
+                confirmed_sequences[out_rec["CodingID"]] = next(SeqIO.parse(rescued_fa, "fasta"))
                 if sid not in sample_best or float(out_rec["bitscore"]) > float(sample_best[sid]["bitscore"]):
                     sample_best[sid] = out_rec
                 all_refs_per_sample.setdefault(sid, []).append(str(out_rec["Matching_pspA_reference"]))
+
+    add_orf_refinement(
+        summary_rows,
+        assemblies_dir=args.assemblies_dir,
+        protein_db=args.protein_db,
+        threads=threads,
+        window=args.orf_window,
+        protein_subject_fasta=args.protein_subject_fasta,
+    )
 
     # Reports
     d06 = os.path.join(args.work_dir, "06_boxb_reports")
     os.makedirs(d06, exist_ok=True)
     summary_csv = os.path.join(d06, "boxB_summary.csv")
-    with open(summary_csv, "w") as f:
-        f.write(",".join(SUMMARY_HEADER) + "\n")
-        for r in summary_rows:
-            row = [str(r.get(k, "")) for k in SUMMARY_HEADER]
-            f.write(",".join(row) + "\n")
+    with open(summary_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=SUMMARY_HEADER)
+        writer.writeheader()
+        writer.writerows({k: r.get(k, "") for k in SUMMARY_HEADER} for r in summary_rows)
+
+    confirmed_sequences_fasta = os.path.join(d06, "confirmed_pspA_sequences.fasta")
+    write_confirmed_pspa_sequences(
+        confirmed_sequences_fasta, confirmed_sequences, summary_rows
+    )
+    if args.build_pspa_alignment:
+        align_confirmed_pspa_sequences(
+            confirmed_sequences_fasta,
+            os.path.join(d06, "confirmed_pspA_alignment.fasta"),
+            threads,
+        )
+
+    confirmed_csv = os.path.join(d06, "confirmed_pspA_hits.csv")
+    with open(confirmed_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=CONFIRMED_HEADER)
+        writer.writeheader()
+        with open(summary_csv, newline="") as summary_file:
+            confirmed_rows = csv.DictReader(summary_file)
+            for r in confirmed_rows:
+                if r.get("Status") not in {"Matched", "Rescue_Matched"}:
+                    continue
+                writer.writerow({
+                    "Assembly": r.get("Sample", ""),
+                    "CodingID": r.get("CodingID", ""),
+                    "Contig": r.get("Contig", ""),
+                    "Strand": r.get("Strand", ""),
+                    "qstart": r.get("qstart", ""),
+                    "qend": r.get("qend", ""),
+                    "BLASTX_start": r.get("BLASTX_start", ""),
+                    "BLASTX_end": r.get("BLASTX_end", ""),
+                    "ORF_start": r.get("ORF_start", ""),
+                    "ORF_end": r.get("ORF_end", ""),
+                    "ORF_confidence": r.get("ORF_confidence", ""),
+                    "PSPA_CONTIG_START": r.get("PSPA_CONTIG_START", ""),
+                    "PSPA_CONTIG_END": r.get("PSPA_CONTIG_END", ""),
+                    "UPSTREAM_CONTIG_BREAK": r.get("UPSTREAM_CONTIG_BREAK", ""),
+                    "Hollingshead_family": r.get("Hollingshead_family", ""),
+                    "pspA_family": r.get("pspA_family", "") or r.get("Hollingshead_family", "").split("_")[0],
+                    "pspA_clade": r.get("pspA_clade", "") or (
+                        r.get("Hollingshead_family", "").split("_")[1]
+                        if "_" in r.get("Hollingshead_family", "") else ""
+                    ),
+                    "Matching_pspA_reference": r.get("Matching_pspA_reference", ""),
+                    "pident": r.get("pident", ""),
+                    "bitscore": r.get("bitscore", ""),
+                    "Status": r.get("Status", ""),
+                    "Source": r.get("Source", ""),
+                })
+
+    if args.build_upstream_tree:
+        upstream_dir = os.path.join(args.work_dir, "08_upstream_phylogeny")
+        build_upstream_phylogeny(
+            confirmed_hits_csv=confirmed_csv,
+            assemblies_root=args.assemblies_dir,
+            gff_root=args.gff_root,
+            metadata_csv=args.metadata_csv,
+            output_dir=upstream_dir,
+            threads=threads,
+            max_upstream_length=args.max_upstream_length,
+        )
 
     compact_csv = os.path.join(d06, "pspA_boxB_compact.csv")
     with open(compact_csv, "w") as f:
